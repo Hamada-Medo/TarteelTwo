@@ -17,6 +17,7 @@ import math
 import os
 import re
 import zipfile
+from bisect import bisect_right
 from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -514,7 +515,16 @@ async def autosave_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── صفحات المصحف ─────────────────────────
-_pdf = fitz.open(QURAN_PDF)
+_pdf = None  # بيتفتح أول ما نحتاجه (الملف بييجي من /download)
+
+
+def get_pdf():
+    global _pdf
+    if _pdf is None:
+        if not Path(QURAN_PDF).exists():
+            raise FileNotFoundError(f"{QURAN_PDF} مش موجود، ابعت /download الأول.")
+        _pdf = fitz.open(QURAN_PDF)
+    return _pdf
 
 
 def today_pages(user: dict) -> list[int]:
@@ -526,7 +536,7 @@ def today_pages(user: dict) -> list[int]:
 def render_page(page_no: int) -> Path:
     out = CACHE_DIR / f"{page_no}.jpg"
     if not out.exists():
-        pix = _pdf[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
+        pix = get_pdf()[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
         pix.save(str(out), jpg_quality=88)
     return out
 
@@ -1128,6 +1138,254 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_health(health_report()), parse_mode="HTML")
 
 
+# ───────────────────────── مصدر المصحف: /download و /Quran ─────────────────────────
+# القناة اللي فيها الـ PDF مثبّت (البوت لازم يكون عضو/أدمن فيها).
+QURAN_SRC_CHAT_ID = int(os.getenv("QURAN_SRC_CHAT_ID", "-1004459978781"))
+QURAN_IMG_SIDE = int(os.getenv("QURAN_IMG_SIDE", "2560"))        # أطول ضلع بالبكسل
+QURAN_IMG_QUALITY = int(os.getenv("QURAN_IMG_QUALITY", "95"))    # جودة JPEG
+QURAN_AS_DOCUMENT = os.getenv("QURAN_AS_DOCUMENT", "0") == "1"   # ١ = ملفات بدل صور (من غير أي ضغط)
+QURAN_GAP = float(os.getenv("QURAN_GAP", "3.2"))                 # ثواني بين كل صفحة (حدود تليجرام)
+
+# (اسم السورة، رقم صفحة بدايتها) في مصحف المدينة ٦٠٤ صفحة.
+SURAHS = [
+    ("الفاتحة", 1), ("البقرة", 2), ("آل عمران", 50), ("النساء", 77), ("المائدة", 106),
+    ("الأنعام", 128), ("الأعراف", 151), ("الأنفال", 177), ("التوبة", 187), ("يونس", 208),
+    ("هود", 221), ("يوسف", 235), ("الرعد", 249), ("إبراهيم", 255), ("الحجر", 262),
+    ("النحل", 267), ("الإسراء", 282), ("الكهف", 293), ("مريم", 305), ("طه", 312),
+    ("الأنبياء", 322), ("الحج", 332), ("المؤمنون", 342), ("النور", 350), ("الفرقان", 359),
+    ("الشعراء", 367), ("النمل", 377), ("القصص", 385), ("العنكبوت", 396), ("الروم", 404),
+    ("لقمان", 411), ("السجدة", 415), ("الأحزاب", 418), ("سبأ", 428), ("فاطر", 434),
+    ("يس", 440), ("الصافات", 446), ("ص", 453), ("الزمر", 458), ("غافر", 467),
+    ("فصلت", 477), ("الشورى", 483), ("الزخرف", 489), ("الدخان", 496), ("الجاثية", 499),
+    ("الأحقاف", 502), ("محمد", 507), ("الفتح", 511), ("الحجرات", 515), ("ق", 518),
+    ("الذاريات", 520), ("الطور", 523), ("النجم", 526), ("القمر", 528), ("الرحمن", 531),
+    ("الواقعة", 534), ("الحديد", 537), ("المجادلة", 542), ("الحشر", 545), ("الممتحنة", 549),
+    ("الصف", 551), ("الجمعة", 553), ("المنافقون", 554), ("التغابن", 556), ("الطلاق", 558),
+    ("التحريم", 560), ("الملك", 562), ("القلم", 564), ("الحاقة", 566), ("المعارج", 568),
+    ("نوح", 570), ("الجن", 572), ("المزمل", 574), ("المدثر", 575), ("القيامة", 577),
+    ("الإنسان", 578), ("المرسلات", 580), ("النبأ", 582), ("النازعات", 583), ("عبس", 585),
+    ("التكوير", 586), ("الانفطار", 587), ("المطففين", 587), ("الانشقاق", 589), ("البروج", 590),
+    ("الطارق", 591), ("الأعلى", 591), ("الغاشية", 592), ("الفجر", 593), ("البلد", 594),
+    ("الشمس", 595), ("الليل", 595), ("الضحى", 596), ("الشرح", 596), ("التين", 597),
+    ("العلق", 597), ("القدر", 598), ("البينة", 598), ("الزلزلة", 599), ("العاديات", 599),
+    ("القارعة", 600), ("التكاثر", 600), ("العصر", 601), ("الهمزة", 601), ("الفيل", 601),
+    ("قريش", 602), ("الماعون", 602), ("الكوثر", 602), ("الكافرون", 603), ("النصر", 603),
+    ("المسد", 603), ("الإخلاص", 604), ("الفلق", 604), ("الناس", 604),
+]
+SURAH_PAGES = [s for _, s in SURAHS]
+JUZ_PAGES = [1] + [20 * (n - 1) + 2 for n in range(2, 31)]  # بداية كل جزء
+# لو صفحة عايز تصحّح اسم سورتها (مثلاً سورة بتخلّص في أول سطرين وبعدها سورة جديدة):
+# PAGE_SURAH_OVERRIDE = {596: ["الليل", "الضحى", "الشرح"]}
+PAGE_SURAH_OVERRIDE: dict[int, list[str]] = {}
+
+
+def page_surahs(p: int) -> list[str]:
+    """السور اللي بتبدأ في الصفحة، ولو مفيش فالسورة اللي مكمّلة من اللي قبلها."""
+    if p in PAGE_SURAH_OVERRIDE:
+        return PAGE_SURAH_OVERRIDE[p]
+    starting = [name for name, start in SURAHS if start == p]
+    if starting:
+        return starting
+    return [SURAHS[bisect_right(SURAH_PAGES, p) - 1][0]]
+
+
+def juz_of(p: int) -> int:
+    return bisect_right(JUZ_PAGES, p)
+
+
+def quran_caption(p: int) -> str:
+    names = page_surahs(p)
+    label = "سورة" if len(names) == 1 else "سور"
+    return f"📖 صفحة {ar(p)} • {label} {' - '.join(names)} • الجزء {ar(juz_of(p))}"
+
+
+def render_quran_image(p: int) -> bytes:
+    """صفحة المصحف كـ JPEG بأعلى جودة (أطول ضلع QURAN_IMG_SIDE بكسل)."""
+    page = get_pdf()[p - 1 + PDF_OFFSET]
+    r = page.rect
+    scale = QURAN_IMG_SIDE / max(r.width, r.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    q = QURAN_IMG_QUALITY
+    data = pix.tobytes("jpeg", jpg_quality=q)
+    # تليجرام بيرفض الصور فوق ١٠ ميجا
+    while not QURAN_AS_DOCUMENT and len(data) > 9_500_000 and q > 60:
+        q -= 10
+        data = pix.tobytes("jpeg", jpg_quality=q)
+    return data
+
+
+quran_task: asyncio.Task | None = None
+quran_stop = False
+
+
+async def download_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بينزّل الـ PDF المثبّت في قناة المصدر ويحطه مكان QURAN_PDF (للأدمن بس)."""
+    global _pdf
+    if not is_admin(update):
+        return
+    bot, chat_id = context.bot, update.effective_chat.id
+    try:
+        src = await bot.get_chat(QURAN_SRC_CHAT_ID)
+    except TelegramError as e:
+        await bot.send_message(chat_id, f"❌ مش قادر أوصل لقناة المصدر: {e}\nتأكد إن البوت عضو/أدمن فيها.")
+        return
+    doc = src.pinned_message.document if src.pinned_message else None
+    if doc is None or not (
+        (doc.file_name or "").lower().endswith(".pdf") or doc.mime_type == "application/pdf"
+    ):
+        await bot.send_message(chat_id, "❌ مفيش ملف PDF مثبّت في قناة المصدر.")
+        return
+
+    mb = (doc.file_size or 0) / 1024 / 1024
+    await bot.send_message(chat_id, f"⏳ بنزّل {doc.file_name or 'PDF'} ({mb:.1f} ميجا)...")
+    tmp = Path(QURAN_PDF).with_name(Path(QURAN_PDF).name + ".part")
+    try:
+        f = await doc.get_file()
+        await f.download_to_drive(tmp)
+    except BadRequest as e:
+        if "too big" in str(e).lower():
+            await bot.send_message(
+                chat_id,
+                "❌ الملف أكبر من ٢٠ ميجا، وده أقصى حجم بيسمح بيه Bot API للتنزيل.\n"
+                "الحلول: تصغّر الـ PDF، أو تشغّل Local Bot API Server (بيرفع الحد لـ ٢٠٠٠ ميجا).",
+            )
+        else:
+            await bot.send_message(chat_id, f"❌ فشل التنزيل: {e}")
+        tmp.unlink(missing_ok=True)
+        return
+    except TelegramError as e:
+        await bot.send_message(chat_id, f"❌ فشل التنزيل: {e}")
+        tmp.unlink(missing_ok=True)
+        return
+
+    try:
+        test = fitz.open(str(tmp), filetype="pdf")
+        n = test.page_count
+        test.close()
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        await bot.send_message(chat_id, f"❌ الملف اتنزّل بس مش PDF سليم: {e}")
+        return
+
+    if _pdf is not None:
+        _pdf.close()
+        _pdf = None
+    tmp.replace(QURAN_PDF)
+    for old in CACHE_DIR.glob("*.jpg"):  # الكاش القديم بتاع نسخة تانية
+        old.unlink(missing_ok=True)
+    warn = ""
+    if n - PDF_OFFSET < TOTAL_PAGES:
+        warn = f"\n⚠️ الصفحات ({ar(n)}) أقل من {ar(TOTAL_PAGES)} + الإزاحة ({ar(PDF_OFFSET)}). راجع PDF_OFFSET."
+    elif n - PDF_OFFSET > TOTAL_PAGES:
+        warn = f"\nℹ️ الـ PDF فيه {ar(n)} صفحة، فلو فيه غلاف قبل صفحة ١ ظبط PDF_OFFSET."
+    await bot.send_message(chat_id, f"✅ اتنزّل المصحف: {ar(n)} صفحة.{warn}")
+
+
+async def quran_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/Quran في قناة التخزين: بيبعت صفحات المصحف كصور بكابشن (رقم الصفحة + السورة + الجزء).
+
+    /Quran        بيكمّل من اللي اتبعت قبل كده
+    /Quran force  بيبعت الـ ٦٠٤ من الأول
+    /Quran stop   بيوقّف الإرسال
+    """
+    global quran_task, quran_stop
+    chat_id = update.effective_chat.id
+    if chat_id != BACKUP_CHAT_ID:
+        return
+    bot = context.bot
+    arg = (context.args[0].lower() if context.args else "")
+    running = quran_task is not None and not quran_task.done()
+
+    if arg == "stop":
+        if running:
+            quran_stop = True
+            await bot.send_message(chat_id, "⏹ هوقّف بعد الصفحة الحالية، وتقدر تكمّل بـ /Quran.")
+        else:
+            await bot.send_message(chat_id, "مفيش إرسال شغّال دلوقتي.")
+        return
+    if running:
+        await bot.send_message(chat_id, "⏳ الإرسال شغّال بالفعل.")
+        return
+    if not Path(QURAN_PDF).exists():
+        await bot.send_message(chat_id, "❌ مفيش PDF، ابعت /download الأول.")
+        return
+
+    store = state.setdefault("quran", {})
+    if arg == "force" or store.get("chat_id") != chat_id:
+        store.clear()
+        store.update({"chat_id": chat_id, "pages": {}})
+    store.setdefault("pages", {})
+    left = TOTAL_PAGES - len(store["pages"])
+    if left <= 0:
+        await bot.send_message(chat_id, "✅ كل الصفحات متبعتة قبل كده. استخدم /Quran force لو عايز تعيد.")
+        return
+    quran_stop = False
+    quran_task = context.application.create_task(send_quran_pages(bot, chat_id))
+    await bot.send_message(chat_id, f"🚀 بدأت إرسال {ar(left)} صفحة. هياخد وقت بسبب حدود تليجرام.")
+
+
+async def send_quran_pages(bot, chat_id: int):
+    pages: dict = state["quran"]["pages"]
+    status = await bot.send_message(chat_id, "📖 الإرسال: ٠%", disable_notification=True)
+    sent = 0
+    try:
+        for p in range(1, TOTAL_PAGES + 1):
+            if quran_stop:
+                break
+            if str(p) in pages:
+                continue
+            data = await asyncio.to_thread(render_quran_image, p)
+            cap = quran_caption(p)
+            msg = None
+            for attempt in range(5):
+                try:
+                    if QURAN_AS_DOCUMENT:
+                        msg = await bot.send_document(
+                            chat_id, document=data, filename=f"{p:03d}.jpg",
+                            caption=cap, disable_notification=True,
+                        )
+                    else:
+                        msg = await bot.send_photo(
+                            chat_id, photo=data, caption=cap, disable_notification=True
+                        )
+                    break
+                except RetryAfter as e:
+                    wait = e.retry_after
+                    wait = wait.total_seconds() if hasattr(wait, "total_seconds") else wait
+                    await asyncio.sleep(wait + RETRY_PAD)
+                except TelegramError as e:
+                    if attempt == 4:
+                        raise
+                    log.warning("Quran page %d failed (%s), retrying.", p, e)
+                    await asyncio.sleep(5)
+            if msg is None:
+                raise RuntimeError(f"page {p}: gave up after repeated flood-waits")
+            pages[str(p)] = msg.message_id
+            sent += 1
+            if sent % 20 == 0:
+                mark_dirty()  # autosave بيرفع الـ zip فيه الـ message IDs
+                with suppress(TelegramError):
+                    await status.edit_text(f"📖 الإرسال: {ar(len(pages))}/{ar(TOTAL_PAGES)}")
+            await asyncio.sleep(QURAN_GAP)
+        done = len(pages) >= TOTAL_PAGES
+        text = (
+            f"✅ خلّصت: {ar(len(pages))} صفحة، والـ message IDs اتحفظت في الـ zip."
+            if done
+            else f"⏹ وقفت عند {ar(len(pages))}/{ar(TOTAL_PAGES)}. كمّل بـ /Quran."
+        )
+        with suppress(TelegramError):
+            await status.edit_text(text)
+    except Exception as e:
+        log.exception("Quran send failed")
+        with suppress(TelegramError):
+            await bot.send_message(
+                chat_id, f"❌ الإرسال وقف عند {ar(len(pages))}/{ar(TOTAL_PAGES)}: {e}\nكمّل بـ /Quran."
+            )
+    finally:
+        mark_dirty()
+        await flush(bot)
+
+
 # ───────────────────────── خطوات الإعدادات ─────────────────────────
 async def ask_pages(bot, chat_id: int):
     nums = [1, 2, 3, 4, 5, 10, 20]
@@ -1474,13 +1732,15 @@ async def post_stop(app: Application):
 def main():
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise SystemExit("حط توكن البوت في BOT_TOKEN جوه bot.py (أو في ملف .env) الأول.")
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_stop(post_stop)
-        .build()
-    )
+    builder = Application.builder().token(BOT_TOKEN).post_init(post_init).post_stop(post_stop)
+    if os.getenv("LOCAL_BOT_API", "") == "1":
+        # Local Bot API Server جوه نفس الكونتينر (start.sh): بيشيل حد ٢٠ ميجا للتنزيل.
+        builder = (
+            builder.base_url("http://localhost:8081/bot")
+            .base_file_url("http://localhost:8081/file/bot")
+            .local_mode(True)
+        )
+    app = builder.build()
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", start))
@@ -1497,6 +1757,10 @@ def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
+    # القنوات بتبعت channel_post مش message، فنضيفها صراحةً للأوامر دي.
+    msg_or_post = filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST
+    app.add_handler(CommandHandler("download", download_cmd, filters=msg_or_post))
+    app.add_handler(CommandHandler("Quran", quran_cmd, filters=msg_or_post))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
