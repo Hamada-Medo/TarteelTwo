@@ -4,7 +4,8 @@ FROM aiogram/telegram-bot-api:latest AS botapi
 # Stage 2: the bot (Alpine to match the musl-linked binary)
 FROM python:3.12-alpine
 
-RUN apk add --no-cache ca-certificates
+# libstdc++/libgcc: needed by telegram-bot-api and PyMuPDF (ffmpeg used to pull them in)
+RUN apk add --no-cache ca-certificates libstdc++ libgcc
 
 COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 

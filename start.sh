@@ -3,16 +3,23 @@ set -e
 
 mkdir -p /data
 
-# Start the Local Bot API server in the background
+# Local Bot API server in the background
 telegram-bot-api \
   --api-id="${TELEGRAM_API_ID}" \
   --api-hash="${TELEGRAM_API_HASH}" \
   --local \
   --http-port=8081 \
-   --dir=/data &
+  --dir=/data/botapi &
 
-# Give it a couple seconds to come up before the bot tries to talk to it
-sleep 3
+# wait until the API server accepts connections (max ~30s)
+python - <<'PY'
+import socket, time
+for _ in range(30):
+    try:
+        socket.create_connection(("localhost", 8081), 1).close()
+        break
+    except OSError:
+        time.sleep(1)
+PY
 
-# Start the Python bot in the foreground (keeps the container alive)
 exec python bot.py
